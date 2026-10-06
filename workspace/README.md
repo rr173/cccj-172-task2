@@ -36,6 +36,15 @@
 6. **并发安全**：SQLite WAL + 进程写锁 + 全部写事务 `BEGIN IMMEDIATE`，
    修复/回放/冻结/豁免四类写操作串行化（见
    `tests/test_platform.py::test_concurrent_mixed_writes_are_serialized`）。
+7. **裁决审计账本只追加且成链**：建产品、数据修复、规则登记/升级/激活、
+   发布裁决、再次请求形成修订、豁免授予/撤销、冻结、凭据签发，每类操作都在
+   **同一写事务**内追加一条不可修改事件；事件含事件类型、业务对象、操作者、
+   时间、关联 revision / run / credential 标识及前一事件摘要。`audit_events`
+   的触发器在引擎层拒绝 UPDATE/DELETE，链摘要
+   `SHA256(prev_digest + "\n" + canonical(payload))` 按产品独立成链。
+8. **审计游标固定读取起点**：游标令牌绑定 `(产品, start_at, end_at,
+   page_size, after_seq)`；事件只追加、序号永不复用，翻页期间的并发写入
+   不会丢事件或重复事件，重试同一游标返回同一页。跨产品/跨范围游标明确拒绝。
 
 ## 规则类型
 
@@ -82,6 +91,48 @@ python3 scripts/demo.py
 | `GET /products/{id}/credentials/{dv}/{rev}` | 下载质量凭据 JSON（含签名） |
 | `GET /products/{id}/credentials/{dv}/latest` | 最新修订版凭据 |
 | `GET /credentials/public-key` / `POST /credentials/verify` | 验签 |
+| `GET /products/{id}/audit?cursor=&page_size=&start_at=&end_at=` | 裁决审计账本游标读取（固定起点，并发写入不丢不重） |
+| `GET /products/{id}/audit/export?format=csv\|json&start_at=&end_at=` | 按事件序号导出全量审计事件（纯只读，不改业务/裁决状态） |
+| `GET /products/{id}/audit/verify?from_seq=1` | 从任意起点重算摘要链验真；链断返回 `409 audit_chain_broken` 并指出断点 |
+
+## 合规复核裁决审计账本
+
+每类合规动作都在业务写事务内原子追加一条事件（同成同败，无孤儿事件）：
+
+| event_type | 触发动作 | 关键关联 |
+|---|---|---|
+| `product_created` | 建产品（固定表结构） | object_id=product_id |
+| `data_repaired` | 数据修复（仅暂存区） | data_version=base_version |
+| `rule_registered` / `rule_upgraded` / `rule_activated` | 规则登记 / 升级 / 激活 | rule_id、rule_fingerprint、version |
+| `adjudication_published` | 发布快照形成 rev1 | data_version, revision=1, run_id |
+| `revision_requested` | 回放再次请求形成新修订 | data_version, revision, run_id |
+| `exemption_granted` / `exemption_revoked` | 豁免授予 / 撤销 | exemption_id、run_id、rule/sample 指纹 |
+| `adjudication_frozen` / `credential_issued` | 冻结 / 凭据签发（幂等再冻结不重复登记） | revision, run_id, credential_id |
+
+事件字段：`seq`（每产品从 1 连续）、`event_id`、`event_type`、
+`object_type/object_id`、`actor`、`occurred_at`、`data_version`、
+`revision`、`run_id`、`credential_id`、`exemption_id`、`rule_id`、
+`detail`（完整业务上下文）、`prev_digest`、`digest`。
+
+**摘要链**（每产品独立锚点）：
+
+```
+digest[1] = SHA256(""          + "\n" + canonical(payload_1))
+digest[n] = SHA256(digest[n-1] + "\n" + canonical(payload_n))
+```
+
+**游标与错误语义**：
+
+* 游标为 base64 的 `{v, product_id, start_at, end_at, page_size, after_seq}`；
+  非法/损坏 → `400 invalid_cursor`，跨产品 →
+  `409 cursor_product_mismatch`，页大小或时间范围与游标不一致 →
+  `409 cursor_scope_mismatch`；
+* 时间范围为半开 `[start_at, end_at)`，须带时区 ISO-8601；`start>=end`
+  的空范围 → `422 invalid_time_range`（无事件匹配则是合法空页，不报错）；
+* 导出为只读事务，不写任何业务/账本数据，不改变裁决状态；
+* 验真返回链状态；内容篡改 → 断点 `digest_mismatch`，删除致序号空洞 →
+  `seq_gap`，前驱摘要对不上 → `prev_digest_mismatch`；`from_seq>1`
+  以前一条事件摘要为锚，锚点缺失 → `422 invalid_from_seq`。
 
 ## 质量凭据格式
 
@@ -117,4 +168,6 @@ python3 -m pytest -q
 
 覆盖：快照不可变、修复隔离、规则升级回放修订链、重复回放拒绝、
 冻结物化解耦事后豁免、凭据签名/篡改检测、豁免精确绑定与 TTL、
-游标跨快照拒绝、四类操作并发交错、各规则引擎定位。
+游标跨快照拒绝、四类操作并发交错、各规则引擎定位、
+审计账本七类动作留痕、并发翻页不丢不重/重试同页、CSV/JSON 只读导出、
+链验真断点定位（篡改/缺号/前驱不符）、append-only 触发器、非法/跨产品游标与空范围错误。

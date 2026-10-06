@@ -18,9 +18,13 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
-from . import rules_engine, security
+from . import audit, rules_engine, security
+from .audit import AuditLedger
 from .models import (
     AdjudicationOut,
+    AuditChainStatus,
+    AuditEventOut,
+    AuditPage,
     CreateProduct,
     CreateRule,
     ExemptionOut,
@@ -105,6 +109,12 @@ class Service:
                     "INSERT INTO tables_def(product_id,table_name,pk_column,columns_json,ordinal)"
                     " VALUES(?,?,?,?,?)",
                     (pid, t.name, t.pk_column, Store.dumps(cols), i))
+            AuditLedger.append(
+                conn, product_id=pid, event_type="product_created",
+                object_type="product", object_id=pid, actor="system",
+                occurred_at=now,
+                detail={"name": req.name,
+                        "tables": [t.name for t in sorted(req.tables, key=lambda x: x.name)]})
         return self.get_product(pid)
 
     def list_products(self) -> list[dict]:
@@ -209,12 +219,17 @@ class Service:
                     n_del += cur.rowcount
 
             event_id = new_id("evt")
+            created_at = iso(self.clock())
             conn.execute(
                 "INSERT INTO repair_events(event_id,product_id,base_version,actor,note,"
                 "upserts,deletes,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (event_id, product_id, base, actor, note, n_up, n_del, iso(self.clock())))
-            created_at = self.store.qone(
-                conn, "SELECT created_at FROM repair_events WHERE event_id=?", (event_id,))["created_at"]
+                (event_id, product_id, base, actor, note, n_up, n_del, created_at))
+            AuditLedger.append(
+                conn, product_id=product_id, event_type="data_repaired",
+                object_type="repair_event", object_id=event_id, actor=actor,
+                occurred_at=created_at, data_version=base,
+                detail={"repair_event_id": event_id, "base_version": base,
+                        "upserts": n_up, "deletes": n_del, "note": note})
         return RepairOut(event_id=event_id, base_version=base,
                          upserts=n_up, deletes=n_del, created_at=created_at)
 
@@ -319,6 +334,7 @@ class Service:
                 raise DomainError(409, "no_changes_since_last_version",
                                   {"latest_version": latest})
             new_version = (latest or 0) + 1
+            published_at = iso(self.clock())
             # 暂存区整体冻结为不可变快照
             for table, rows in staging.items():
                 for pk, payload in rows.items():
@@ -330,7 +346,7 @@ class Service:
             conn.execute(
                 "INSERT INTO product_versions(product_id,data_version,schema_fingerprint,created_at)"
                 " VALUES(?,?,?,?)",
-                (product_id, new_version, sfp, iso(self.clock())))
+                (product_id, new_version, sfp, published_at))
             rules = self._active_rules(conn, product_id)
             failures = self._execute_ruleset(conn, product_id, new_version, rules)
             run_id = self._record_run(conn, product_id, new_version, "publish", rules, failures)
@@ -339,8 +355,18 @@ class Service:
                 "published_at,frozen_at,ruleset_fingerprint,failure_count,"
                 "suppressed_count,effective_count) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (product_id, new_version, 1, run_id, "open",
-                 iso(self.clock()), None, self._ruleset_fingerprint(rules),
+                 published_at, None, self._ruleset_fingerprint(rules),
                  len(failures), None, None))
+            AuditLedger.append(
+                conn, product_id=product_id, event_type="adjudication_published",
+                object_type="adjudication",
+                object_id=f"{product_id}:v{new_version}:r1",
+                actor=actor, occurred_at=published_at,
+                data_version=new_version, revision=1, run_id=run_id,
+                detail={"data_version": new_version, "revision": 1,
+                        "trigger": "publish", "failure_count": len(failures),
+                        "ruleset_fingerprint": self._ruleset_fingerprint(rules),
+                        "schema_fingerprint": sfp, "note": note})
             adj = self._load_adjudication(conn, product_id, new_version, 1)
         return self._adjudication_out(adj)
 
@@ -367,6 +393,13 @@ class Service:
                 " VALUES(?,?,?,?,?,?)",
                 (rule_id, 1, req.kind, Store.dumps(req.config),
                  rules_engine.fingerprint(req.kind, req.config), now))
+            AuditLedger.append(
+                conn, product_id=req.product_id, event_type="rule_registered",
+                object_type="rule", object_id=rule_id, actor="system",
+                occurred_at=now, rule_id=rule_id,
+                detail={"rule_id": rule_id, "name": req.name, "kind": req.kind,
+                        "version": 1, "config": req.config,
+                        "rule_fingerprint": rules_engine.fingerprint(req.kind, req.config)})
         return self.get_rule(rule_id)
 
     def _require_rule(self, conn: sqlite3.Connection, rule_id: str) -> sqlite3.Row:
@@ -404,19 +437,40 @@ class Service:
                 (rule_id, version, kind, Store.dumps(config), fp, now))
             conn.execute("UPDATE rules SET active_version=? WHERE rule_id=?",
                          (version, rule_id))
+            AuditLedger.append(
+                conn, product_id=rule["product_id"], event_type="rule_upgraded",
+                object_type="rule", object_id=rule_id, actor="system",
+                occurred_at=now, rule_id=rule_id,
+                detail={"rule_id": rule_id, "version": version, "kind": kind,
+                        "config": config, "rule_fingerprint": fp,
+                        "previous_version": rule["active_version"],
+                        "activated": True})
         return self.get_rule(rule_id)
 
     def activate_rule(self, rule_id: str, version: int) -> RuleOut:
         with self.store.tx(write=True) as conn:
-            self._require_rule(conn, rule_id)
+            rule = self._require_rule(conn, rule_id)
             row = self.store.qone(
                 conn, "SELECT 1 FROM rule_versions WHERE rule_id=? AND version=?",
                 (rule_id, version))
             if row is None:
                 raise DomainError(404, "rule_version_not_found",
                                   {"rule_id": rule_id, "version": version})
+            fp_row = self.store.qone(
+                conn, "SELECT fingerprint,kind,config_json FROM rule_versions "
+                      "WHERE rule_id=? AND version=?", (rule_id, version))
+            now = iso(self.clock())
             conn.execute("UPDATE rules SET active_version=? WHERE rule_id=?",
                          (version, rule_id))
+            if version != rule["active_version"]:
+                AuditLedger.append(
+                    conn, product_id=rule["product_id"], event_type="rule_activated",
+                    object_type="rule", object_id=rule_id, actor="system",
+                    occurred_at=now, rule_id=rule_id,
+                    detail={"rule_id": rule_id, "version": version,
+                            "kind": fp_row["kind"],
+                            "rule_fingerprint": fp_row["fingerprint"],
+                            "previous_version": rule["active_version"]})
         return self.get_rule(rule_id)
 
     def list_rules(self, product_id: str) -> list[RuleOut]:
@@ -486,12 +540,23 @@ class Service:
                 conn,
                 "SELECT COALESCE(MAX(revision),0)+1 AS n FROM adjudications "
                 "WHERE product_id=? AND data_version=?", (product_id, version))["n"]
+            now = iso(self.clock())
             conn.execute(
                 "INSERT INTO adjudications(product_id,data_version,revision,run_id,status,"
                 "published_at,frozen_at,ruleset_fingerprint,failure_count,"
                 "suppressed_count,effective_count) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (product_id, version, rev, run_id, "open",
-                 iso(self.clock()), None, rsfp, len(failures), None, None))
+                 now, None, rsfp, len(failures), None, None))
+            AuditLedger.append(
+                conn, product_id=product_id, event_type="revision_requested",
+                object_type="adjudication",
+                object_id=f"{product_id}:v{version}:r{rev}",
+                actor=req.actor, occurred_at=now,
+                data_version=version, revision=rev, run_id=run_id,
+                detail={"data_version": version, "revision": rev,
+                        "trigger": "replay", "failure_count": len(failures),
+                        "ruleset_fingerprint": rsfp,
+                        "rule_versions": {r["rule_id"]: r["version"] for r in rules}})
             adj = self._load_adjudication(conn, product_id, version, rev)
         return self._adjudication_out(adj)
 
@@ -668,6 +733,27 @@ class Service:
                 "body_json,signature,created_at) VALUES(?,?,?,?,?,?,?)",
                 (cred_id, product_id, data_version, revision,
                  Store.dumps(body), signature, frozen_at))
+            # 冻结与凭据签发是两个独立合规事件，同一事务内顺序追加；
+            # 幂等再冻结走上面的既有凭据分支，不产生新事件。
+            AuditLedger.append(
+                conn, product_id=product_id, event_type="adjudication_frozen",
+                object_type="adjudication",
+                object_id=f"{product_id}:v{data_version}:r{revision}",
+                actor="system", occurred_at=frozen_at,
+                data_version=data_version, revision=revision, run_id=adj["run_id"],
+                detail={"data_version": data_version, "revision": revision,
+                        "verdict": body["verdict"], "failure_count": total,
+                        "suppressed_count": suppressed,
+                        "effective_count": effective})
+            AuditLedger.append(
+                conn, product_id=product_id, event_type="credential_issued",
+                object_type="credential", object_id=cred_id,
+                actor="system", occurred_at=frozen_at,
+                data_version=data_version, revision=revision, run_id=adj["run_id"],
+                credential_id=cred_id,
+                detail={"credential_id": cred_id,
+                        "ruleset_fingerprint": adj["ruleset_fingerprint"],
+                        "verdict": body["verdict"], "algorithm": "Ed25519"})
             adj = self._load_adjudication(conn, product_id, data_version, revision)
             out = self._adjudication_out_conn(conn, adj)
             return out, body, signature
@@ -784,6 +870,7 @@ class Service:
                 raise DomainError(409, "exemption_exists",
                                   {"exemption_id": dup["exemption_id"]})
             now = self.clock()
+            created_at = iso(now)
             expires = iso(now + timedelta(seconds=ttl_seconds)) if ttl_seconds else None
             eid = new_id("exmp")
             conn.execute(
@@ -794,7 +881,20 @@ class Service:
                 (eid, run["product_id"], run["data_version"], f["rule_id"],
                  f["rule_version"], f["rule_fingerprint"], f["sample_fingerprint"],
                  f["table_name"], f["row_pk"], reason, actor, "active",
-                 expires, iso(now), None))
+                 expires, created_at, None))
+            AuditLedger.append(
+                conn, product_id=run["product_id"], event_type="exemption_granted",
+                object_type="exemption", object_id=eid, actor=actor,
+                occurred_at=created_at,
+                data_version=run["data_version"], run_id=run_id, exemption_id=eid,
+                rule_id=f["rule_id"],
+                detail={"exemption_id": eid, "run_id": run_id,
+                        "data_version": run["data_version"],
+                        "rule_id": f["rule_id"], "rule_version": f["rule_version"],
+                        "rule_fingerprint": f["rule_fingerprint"],
+                        "sample_fingerprint": f["sample_fingerprint"],
+                        "table_name": f["table_name"], "row_pk": f["row_pk"],
+                        "reason": reason, "expires_at": expires})
             row = self.store.qone(
                 conn, "SELECT * FROM exemptions WHERE exemption_id=?", (eid,))
         return self._exemption_out(row)
@@ -807,9 +907,23 @@ class Service:
                 raise DomainError(404, "exemption_not_found", exemption_id)
             if row["status"] == "revoked":
                 raise DomainError(409, "exemption_already_revoked", exemption_id)
+            revoked_at = iso(self.clock())
             conn.execute(
                 "UPDATE exemptions SET status='revoked', revoked_at=? WHERE exemption_id=?",
-                (iso(self.clock()), exemption_id))
+                (revoked_at, exemption_id))
+            AuditLedger.append(
+                conn, product_id=row["product_id"], event_type="exemption_revoked",
+                object_type="exemption", object_id=exemption_id, actor=actor,
+                occurred_at=revoked_at,
+                data_version=row["data_version"], exemption_id=exemption_id,
+                rule_id=row["rule_id"],
+                detail={"exemption_id": exemption_id,
+                        "data_version": row["data_version"],
+                        "rule_id": row["rule_id"], "rule_version": row["rule_version"],
+                        "rule_fingerprint": row["rule_fingerprint"],
+                        "sample_fingerprint": row["sample_fingerprint"],
+                        "table_name": row["table_name"], "row_pk": row["row_pk"],
+                        "reason": reason})
             row = self.store.qone(
                 conn, "SELECT * FROM exemptions WHERE exemption_id=?", (exemption_id,))
         return self._exemption_out(row)
@@ -891,3 +1005,164 @@ class Service:
     def verify_credential(self, body: dict, signature: str) -> bool:
         pub = security.get_public_key_pem(self.store)
         return security.verify_body(pub, body, signature)
+
+    # =====================================================================
+    # 合规复核：裁决审计账本（游标读取 / 导出 / 链验真）
+    # =====================================================================
+
+    @staticmethod
+    def _parse_iso(value: str, param: str) -> str:
+        """解析 ISO-8601 时间边界，统一归一化为内部 UTC 文本以便字典序比较。"""
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            raise DomainError(422, "invalid_time_range",
+                              {"param": param, "value": value,
+                               "message": "时间须为 ISO-8601，如 2026-01-01T00:00:00Z"})
+        if dt.tzinfo is None:
+            raise DomainError(422, "invalid_time_range",
+                              {"param": param, "value": value,
+                               "message": "时间必须带时区（建议直接用 Z 结尾的 UTC）"})
+        return iso(dt)
+
+    @staticmethod
+    def _encode_cursor(token: dict) -> str:
+        return _b64e(Store.dumps(token).encode("utf-8"))
+
+    @staticmethod
+    def _decode_cursor(cursor: str) -> dict:
+        try:
+            token = json.loads(_b64d(cursor.encode("ascii")))
+        except Exception:
+            raise DomainError(400, "invalid_cursor", "审计游标无法解析或已损坏")
+        if not isinstance(token, dict) or "v" not in token:
+            raise DomainError(400, "invalid_cursor", "审计游标结构不合法")
+        return token
+
+    def _resolve_audit_scope(self, conn: sqlite3.Connection, product_id: str,
+                             start_at: str | None, end_at: str | None
+                             ) -> tuple[str | None, str | None]:
+        self._require_product(conn, product_id)
+        s = self._parse_iso(start_at, "start_at") if start_at else None
+        e = self._parse_iso(end_at, "end_at") if end_at else None
+        if s is not None and e is not None and s >= e:
+            raise DomainError(422, "invalid_time_range",
+                              {"start_at": start_at, "end_at": end_at,
+                               "message": "空范围：start_at 必须早于 end_at（半开区间 [start,end)）"})
+        return s, e
+
+    def audit_page(self, product_id: str, *, cursor: str | None,
+                   page_size: int, start_at: str | None,
+                   end_at: str | None) -> AuditPage:
+        if page_size < 1 or page_size > 200:
+            raise DomainError(422, "invalid_page_size", "page_size 须在 1..200")
+
+        s_raw, e_raw = start_at, end_at
+        if cursor:
+            token = self._decode_cursor(cursor)
+            if token.get("v") != 1:
+                raise DomainError(400, "invalid_cursor", "不支持的游标版本")
+            if token.get("product_id") != product_id:
+                raise DomainError(
+                    409, "cursor_product_mismatch",
+                    {"cursor_product": token.get("product_id"),
+                     "request_product": product_id,
+                     "message": "游标绑定另一个产品，审计链不可跨产品分页"})
+            after_seq = int(token.get("after_seq", 0))
+            if token.get("start_at") != (s_raw or ""):
+                raise DomainError(409, "cursor_scope_mismatch",
+                                  "游标绑定的 start_at 与当前请求不一致，时间范围不可中途更换")
+            if token.get("end_at") != (e_raw or ""):
+                raise DomainError(409, "cursor_scope_mismatch",
+                                  "游标绑定的 end_at 与当前请求不一致，时间范围不可中途更换")
+            if int(token.get("page_size", -1)) != page_size:
+                raise DomainError(409, "cursor_scope_mismatch",
+                                  "游标绑定的 page_size 与当前请求不一致")
+        else:
+            after_seq = 0
+
+        with self.store.tx() as conn:
+            s, e = self._resolve_audit_scope(conn, product_id, s_raw, e_raw)
+            rows = AuditLedger.read_page(
+                conn, product_id, after_seq=after_seq, limit=page_size + 1,
+                start_at=s, end_at=e)
+            tip = AuditLedger.tip(conn, product_id)
+            page = rows[:page_size]
+            items = [AuditEventOut(**audit.event_out(r)) for r in page]
+            next_cursor = None
+            if len(rows) > page_size:
+                next_cursor = self._encode_cursor({
+                    "v": 1, "product_id": product_id,
+                    "start_at": s_raw or "", "end_at": e_raw or "",
+                    "page_size": page_size, "after_seq": page[-1]["seq"],
+                })
+            tip_seq = tip["seq"] if tip else 0
+        return AuditPage(
+            product_id=product_id, page_size=page_size,
+            start_at=s_raw, end_at=e_raw, after_seq=after_seq,
+            next_cursor=next_cursor, items=items, tip_seq=tip_seq)
+
+    def audit_export(self, product_id: str, *, fmt: str,
+                     start_at: str | None, end_at: str | None
+                     ) -> tuple[str, str, str]:
+        """按时间范围导出全量事件（CSV / JSON）；纯只读，绝不写业务/账本数据。
+
+        返回 (filename, media_type, payload)。
+        """
+        if fmt not in ("csv", "json"):
+            raise DomainError(422, "invalid_export_format",
+                              {"format": fmt, "allowed": ["csv", "json"]})
+        with self.store.tx() as conn:
+            s, e = self._resolve_audit_scope(conn, product_id, start_at, end_at)
+            rows = AuditLedger.read_range(
+                conn, product_id, start_at=s, end_at=e, from_seq=1)
+            events = [audit.event_out(r) for r in rows]
+            tip = AuditLedger.tip(conn, product_id)
+        tip_seq = tip["seq"] if tip else 0
+        tip_digest = tip["digest"] if tip else None
+
+        if fmt == "json":
+            doc = {
+                "export": "audit-ledger",
+                "product_id": product_id,
+                "start_at": start_at,
+                "end_at": end_at,
+                "count": len(events),
+                "tip_seq": tip_seq,
+                "tip_digest": tip_digest,
+                "events": events,
+            }
+            payload = json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True)
+            return f"audit-{product_id}.json", "application/json", payload
+
+        import csv
+        import io
+        buf = io.StringIO()
+        cols = ["product_id", "seq", "event_id", "event_type", "object_type",
+                "object_id", "actor", "occurred_at", "data_version", "revision",
+                "run_id", "credential_id", "exemption_id", "rule_id",
+                "prev_digest", "digest", "detail"]
+        writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        writer.writeheader()
+        for ev in events:
+            row = dict(ev)
+            row["detail"] = Store.dumps(ev["detail"])
+            writer.writerow(row)
+        return f"audit-{product_id}.csv", "text/csv", buf.getvalue()
+
+    def audit_verify(self, product_id: str, from_seq: int = 1) -> AuditChainStatus:
+        if not isinstance(from_seq, int) or from_seq < 1:
+            raise DomainError(422, "invalid_from_seq",
+                              {"from_seq": from_seq, "message": "from_seq 须为 >=1 的整数"})
+        with self.store.tx() as conn:
+            self._require_product(conn, product_id)
+            try:
+                result = AuditLedger.verify_chain(conn, product_id, from_seq=from_seq)
+            except ValueError as ex:
+                raise DomainError(422, "invalid_from_seq", str(ex))
+        status = AuditChainStatus(**result)
+        if not status.valid:
+            # 被篡改的事件链是明确的业务冲突，而非请求格式错误
+            raise DomainError(409, "audit_chain_broken", status.model_dump(by_alias=True))
+        return status
+

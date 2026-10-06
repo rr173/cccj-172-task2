@@ -250,6 +250,43 @@ def create_app(store: Store | None = None) -> FastAPI:
     def health():
         return {"status": "ok"}
 
+    # ---------------- 合规复核：裁决审计账本 ----------------
+
+    @app.get("/products/{product_id}/audit",
+             tags=["合规审计账本"],
+             summary="按产品+时间范围游标读取审计事件（固定起点，并发写入不丢不重）")
+    def audit_page(product_id: str,
+                   cursor: str | None = Query(default=None),
+                   page_size: int = Query(default=50, ge=1, le=200),
+                   start_at: str | None = Query(default=None, description="ISO-8601，含"),
+                   end_at: str | None = Query(default=None, description="ISO-8601，不含"),
+                   service: Service = Depends(svc)):
+        return service.audit_page(
+            product_id, cursor=cursor, page_size=page_size,
+            start_at=start_at, end_at=end_at)
+
+    @app.get("/products/{product_id}/audit/export",
+             tags=["合规审计账本"],
+             summary="按时间范围导出全量审计事件（format=csv|json，按 seq 升序；纯只读）")
+    def audit_export(product_id: str,
+                     format: str = Query(default="csv", pattern="^(csv|json)$"),
+                     start_at: str | None = Query(default=None),
+                     end_at: str | None = Query(default=None),
+                     service: Service = Depends(svc)):
+        filename, media_type, payload = service.audit_export(
+            product_id, fmt=format, start_at=start_at, end_at=end_at)
+        return Response(
+            content=payload, media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    @app.get("/products/{product_id}/audit/verify",
+             tags=["合规审计账本"],
+             summary="从任意起点重算摘要链验真；链断时返回 409 并指出断点")
+    def audit_verify(product_id: str,
+                     from_seq: int = Query(default=1, ge=1),
+                     service: Service = Depends(svc)):
+        return service.audit_verify(product_id, from_seq=from_seq)
+
     return app
 
 

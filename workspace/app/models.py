@@ -194,6 +194,70 @@ class CredentialOut(BaseModel):
     verify_url: str
 
 
+# ---------- 合规复核：裁决审计账本 ----------
+
+AuditEventType = Literal[
+    "product_created",
+    "data_repaired",
+    "adjudication_published",
+    "rule_registered",
+    "rule_upgraded",
+    "rule_activated",
+    "revision_requested",
+    "exemption_granted",
+    "exemption_revoked",
+    "adjudication_frozen",
+    "credential_issued",
+]
+
+
+class AuditEventOut(BaseModel):
+    product_id: str
+    seq: int
+    event_id: str
+    event_type: AuditEventType
+    object_type: str
+    object_id: str | None = None
+    actor: str
+    occurred_at: str
+    data_version: int | None = None
+    revision: int | None = None
+    run_id: str | None = None
+    credential_id: str | None = None
+    exemption_id: str | None = None
+    rule_id: str | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
+    prev_digest: str
+    digest: str
+
+
+class AuditPage(BaseModel):
+    product_id: str
+    page_size: int
+    start_at: str | None = None
+    end_at: str | None = None
+    after_seq: int
+    next_cursor: str | None = None
+    tip_seq: int
+    items: list[AuditEventOut]
+    snapshot_note: str = (
+        "游标绑定固定读取起点(产品/时间范围/页大小/after_seq)；"
+        "事件只追加且序号永不复用，并发写入不会让翻页丢事件或重复事件，"
+        "重试同一游标返回同一页")
+
+
+class AuditChainStatus(BaseModel):
+    valid: bool
+    product_id: str
+    from_seq: int
+    checked: int
+    tip_seq: int
+    tip_digest: str | None = None
+    break_: dict[str, Any] | None = Field(default=None, alias="break")
+
+    model_config = {"populate_by_name": True}
+
+
 class ErrorOut(BaseModel):
     error: str
     detail: Any = None

@@ -169,6 +169,48 @@ CREATE TABLE IF NOT EXISTS credentials (
     created_at   TEXT NOT NULL,
     UNIQUE (product_id, data_version, revision)
 );
+
+-- ---------------------------------------------------------------------
+-- 合规复核裁决审计账本：每产品一条独立哈希链（seq 从 1 单调递增）。
+-- 只追加：UPDATE / DELETE 由触发器在引擎层拒绝；链尾摘要按
+--   digest = SHA256(canonical({prev_digest, payload}))
+-- 逐条链接，任何字段篡改都会在验真接口暴露为明确断点。
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_events (
+    product_id    TEXT NOT NULL,
+    seq           INTEGER NOT NULL,
+    event_id      TEXT NOT NULL,
+    event_type    TEXT NOT NULL,
+    object_type   TEXT NOT NULL,
+    object_id     TEXT,
+    actor         TEXT NOT NULL,
+    occurred_at   TEXT NOT NULL,
+    data_version  INTEGER,
+    revision      INTEGER,
+    run_id        TEXT,
+    credential_id TEXT,
+    exemption_id  TEXT,
+    rule_id       TEXT,
+    detail_json   TEXT NOT NULL,
+    prev_digest   TEXT NOT NULL,
+    digest        TEXT NOT NULL,
+    PRIMARY KEY (product_id, seq)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_audit_event_id ON audit_events(event_id);
+CREATE INDEX IF NOT EXISTS ix_audit_product_time
+    ON audit_events(product_id, occurred_at, seq);
+
+CREATE TRIGGER IF NOT EXISTS trg_audit_no_update
+BEFORE UPDATE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_audit_no_delete
+BEFORE DELETE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only: DELETE is forbidden');
+END;
 """
 
 
