@@ -36,6 +36,13 @@
 6. **并发安全**：SQLite WAL + 进程写锁 + 全部写事务 `BEGIN IMMEDIATE`，
    修复/回放/冻结/豁免四类写操作串行化（见
    `tests/test_platform.py::test_concurrent_mixed_writes_are_serialized`）。
+7. **裁决审计账本（仅追加哈希链）**：数据修复、规则登记/升级/激活、
+   发布裁决、回放形成修订、豁免授予/撤销、冻结、凭据签发，每一个动作都在
+   **同一写事务内**向 `audit_events` 追加一条不可修改事件；事务回滚则
+   事件一并回滚。链按产品独立、`seq` 从 1 连续递增，每条事件携带
+   `prev_digest`，本事件 `digest = SHA256(canonical(全部字段 + prev_digest))`，
+   带外删除/改写任何字段都会在验真时按序号精确报出断点。服务层没有任何
+   更新/删除账本的代码路径。
 
 ## 规则类型
 
@@ -83,6 +90,38 @@ python3 scripts/demo.py
 | `GET /products/{id}/credentials/{dv}/latest` | 最新修订版凭据 |
 | `GET /credentials/public-key` / `POST /credentials/verify` | 验签 |
 
+### 裁决审计账本（合规复核）
+
+| 方法 & 路径 | 说明 |
+|---|---|
+| `GET /products/{id}/audit/events?start_time=&end_time=&page_size=&cursor=` | 按产品 + 时间范围（半开区间，ISO-8601）游标读取事件 |
+| `GET /products/{id}/audit/export?start_seq=&end_seq=&fmt=json\|csv` | 按事件序号区间导出 JSON 或 CSV 文件 |
+| `GET /products/{id}/audit/verify?start_seq=&end_seq=` | 从任意序号重算摘要链验真，断点精确到序号 |
+
+事件类型：`data_repaired` / `rule_registered` / `rule_upgraded` /
+`rule_activated` / `adjudication_published` / `revision_requested`（再次请求
+回放形成修订）/ `exemption_granted` / `exemption_revoked` /
+`adjudication_frozen` / `credential_issued`。
+
+每条事件包含：事件类型、业务对象（`object_type` + `object_ref`）、操作者
+`actor`、时间 `occurred_at`、关联 `data_version` / `revision` / `run_id` /
+`credential_id`、事件细节 `payload`、`prev_digest` 与本事件 `digest`。
+
+**游标语义**：游标是 base64 的
+`{p:产品, a:起始 after_seq, s/e:时间范围, ps:页大小}`，按
+`(product_id, seq)` keyset 翻页；账本只追加，期间并发写入不会让翻页
+丢事件或重复事件，重试同一游标返回同一页。明确错误：非法游标
+`400 invalid_cursor`、跨产品游标 `409 cursor_product_mismatch`、
+游标时间范围与请求不一致 `409 cursor_scope_mismatch`、空范围
+`404 audit_empty_range`。
+
+**验真**：逐链环核对 seq 连续性、`prev_digest` 与重算摘要；断裂返回
+`409 audit_chain_broken`，`detail.kind` 为 `missing_event`（删除致空洞）、
+`prev_digest_mismatch` / `genesis_mismatch`（链指针被伪造）或
+`digest_mismatch`（字段/payload 被篡改），并给出 `seq`、存储值与重算值。
+`start_seq>1` 时以 `start_seq-1` 的已存摘要为锚点，可对任意子链验真。
+导出与验真均为只读，绝不改变业务数据、裁决状态，也不产生新审计事件。
+
 ## 质量凭据格式
 
 下载文件为
@@ -117,4 +156,6 @@ python3 -m pytest -q
 
 覆盖：快照不可变、修复隔离、规则升级回放修订链、重复回放拒绝、
 冻结物化解耦事后豁免、凭据签名/篡改检测、豁免精确绑定与 TTL、
-游标跨快照拒绝、四类操作并发交错、各规则引擎定位。
+游标跨快照拒绝、四类操作并发交错、各规则引擎定位，以及审计账本：
+全动作同事务落账、游标并发写入不丢不重与重试幂等、跨产品/非法/范围
+不一致游标与空范围错误、JSON/CSV 只读导出、摘要链验真与各类断点精确定位。

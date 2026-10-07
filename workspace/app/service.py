@@ -18,7 +18,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
-from . import rules_engine, security
+from . import audit, rules_engine, security
+from .errors import DomainError
 from .models import (
     AdjudicationOut,
     CreateProduct,
@@ -35,12 +36,8 @@ from .models import (
 from .storage import Store
 
 
-class DomainError(Exception):
-    def __init__(self, status_code: int, error: str, detail: Any = None):
-        super().__init__(error)
-        self.status_code = status_code
-        self.error = error
-        self.detail = detail
+# DomainError 定义在 .errors；此处的导入即为本模块对外的再导出
+# （api.py 仍使用 ``from .service import DomainError``），审计模块也导入同一类型。
 
 
 def utcnow() -> datetime:
@@ -209,12 +206,18 @@ class Service:
                     n_del += cur.rowcount
 
             event_id = new_id("evt")
+            repaired_at = iso(self.clock())
             conn.execute(
                 "INSERT INTO repair_events(event_id,product_id,base_version,actor,note,"
                 "upserts,deletes,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (event_id, product_id, base, actor, note, n_up, n_del, iso(self.clock())))
-            created_at = self.store.qone(
-                conn, "SELECT created_at FROM repair_events WHERE event_id=?", (event_id,))["created_at"]
+                (event_id, product_id, base, actor, note, n_up, n_del, repaired_at))
+            audit.append_event(
+                conn, product_id=product_id, event_type="data_repaired",
+                object_type="repair_event", object_ref=event_id, actor=actor,
+                occurred_at=repaired_at, data_version=base,
+                payload={"note": note, "upserts": n_up, "deletes": n_del,
+                         "base_version": base, "repair_event_id": event_id})
+            created_at = repaired_at
         return RepairOut(event_id=event_id, base_version=base,
                          upserts=n_up, deletes=n_del, created_at=created_at)
 
@@ -334,13 +337,24 @@ class Service:
             rules = self._active_rules(conn, product_id)
             failures = self._execute_ruleset(conn, product_id, new_version, rules)
             run_id = self._record_run(conn, product_id, new_version, "publish", rules, failures)
+            published_at = iso(self.clock())
+            rsfp = self._ruleset_fingerprint(rules)
             conn.execute(
                 "INSERT INTO adjudications(product_id,data_version,revision,run_id,status,"
                 "published_at,frozen_at,ruleset_fingerprint,failure_count,"
                 "suppressed_count,effective_count) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (product_id, new_version, 1, run_id, "open",
-                 iso(self.clock()), None, self._ruleset_fingerprint(rules),
-                 len(failures), None, None))
+                 published_at, None, rsfp, len(failures), None, None))
+            audit.append_event(
+                conn, product_id=product_id, event_type="adjudication_published",
+                object_type="adjudication",
+                object_ref=f"{product_id}:v{new_version}:r1",
+                actor=actor, occurred_at=published_at,
+                data_version=new_version, revision=1, run_id=run_id,
+                payload={"trigger": "publish", "note": note,
+                         "data_version": new_version, "revision": 1,
+                         "run_id": run_id, "ruleset_fingerprint": rsfp,
+                         "failure_count": len(failures)})
             adj = self._load_adjudication(conn, product_id, new_version, 1)
         return self._adjudication_out(adj)
 
@@ -358,6 +372,7 @@ class Service:
                 raise DomainError(422, "invalid_rule", str(e))
             rule_id = new_id("rule")
             now = iso(self.clock())
+            fp = rules_engine.fingerprint(req.kind, req.config)
             conn.execute(
                 "INSERT INTO rules(rule_id,product_id,name,active_version,created_at)"
                 " VALUES(?,?,?,?,?)",
@@ -365,8 +380,14 @@ class Service:
             conn.execute(
                 "INSERT INTO rule_versions(rule_id,version,kind,config_json,fingerprint,created_at)"
                 " VALUES(?,?,?,?,?,?)",
-                (rule_id, 1, req.kind, Store.dumps(req.config),
-                 rules_engine.fingerprint(req.kind, req.config), now))
+                (rule_id, 1, req.kind, Store.dumps(req.config), fp, now))
+            audit.append_event(
+                conn, product_id=req.product_id, event_type="rule_registered",
+                object_type="rule", object_ref=rule_id, actor=req.actor,
+                occurred_at=now,
+                payload={"rule_id": rule_id, "name": req.name, "version": 1,
+                         "kind": req.kind, "config": req.config,
+                         "rule_fingerprint": fp})
         return self.get_rule(rule_id)
 
     def _require_rule(self, conn: sqlite3.Connection, rule_id: str) -> sqlite3.Row:
@@ -375,7 +396,8 @@ class Service:
             raise DomainError(404, "rule_not_found", rule_id)
         return row
 
-    def add_rule_version(self, rule_id: str, kind: str, config: dict) -> RuleOut:
+    def add_rule_version(self, rule_id: str, kind: str, config: dict,
+                         actor: str = "system") -> RuleOut:
         with self.store.tx(write=True) as conn:
             rule = self._require_rule(conn, rule_id)
             schemas = rules_engine.load_schemas(conn, rule["product_id"])
@@ -404,19 +426,37 @@ class Service:
                 (rule_id, version, kind, Store.dumps(config), fp, now))
             conn.execute("UPDATE rules SET active_version=? WHERE rule_id=?",
                          (version, rule_id))
+            audit.append_event(
+                conn, product_id=rule["product_id"], event_type="rule_upgraded",
+                object_type="rule", object_ref=rule_id, actor=actor,
+                occurred_at=now,
+                payload={"rule_id": rule_id, "version": version,
+                         "previous_active_version": rule["active_version"],
+                         "kind": kind, "config": config, "rule_fingerprint": fp})
         return self.get_rule(rule_id)
 
-    def activate_rule(self, rule_id: str, version: int) -> RuleOut:
+    def activate_rule(self, rule_id: str, version: int,
+                      actor: str = "system") -> RuleOut:
         with self.store.tx(write=True) as conn:
-            self._require_rule(conn, rule_id)
+            rule = self._require_rule(conn, rule_id)
             row = self.store.qone(
-                conn, "SELECT 1 FROM rule_versions WHERE rule_id=? AND version=?",
+                conn, "SELECT fingerprint FROM rule_versions WHERE rule_id=? AND version=?",
                 (rule_id, version))
             if row is None:
                 raise DomainError(404, "rule_version_not_found",
                                   {"rule_id": rule_id, "version": version})
+            previous = rule["active_version"]
+            now = iso(self.clock())
             conn.execute("UPDATE rules SET active_version=? WHERE rule_id=?",
                          (version, rule_id))
+            if previous != version:
+                audit.append_event(
+                    conn, product_id=rule["product_id"], event_type="rule_activated",
+                    object_type="rule", object_ref=rule_id, actor=actor,
+                    occurred_at=now,
+                    payload={"rule_id": rule_id, "version": version,
+                             "previous_active_version": previous,
+                             "rule_fingerprint": row["fingerprint"]})
         return self.get_rule(rule_id)
 
     def list_rules(self, product_id: str) -> list[RuleOut]:
@@ -486,12 +526,25 @@ class Service:
                 conn,
                 "SELECT COALESCE(MAX(revision),0)+1 AS n FROM adjudications "
                 "WHERE product_id=? AND data_version=?", (product_id, version))["n"]
+            replayed_at = iso(self.clock())
             conn.execute(
                 "INSERT INTO adjudications(product_id,data_version,revision,run_id,status,"
                 "published_at,frozen_at,ruleset_fingerprint,failure_count,"
                 "suppressed_count,effective_count) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (product_id, version, rev, run_id, "open",
-                 iso(self.clock()), None, rsfp, len(failures), None, None))
+                 replayed_at, None, rsfp, len(failures), None, None))
+            audit.append_event(
+                conn, product_id=product_id, event_type="revision_requested",
+                object_type="adjudication",
+                object_ref=f"{product_id}:v{version}:r{rev}",
+                actor=req.actor, occurred_at=replayed_at,
+                data_version=version, revision=rev, run_id=run_id,
+                payload={"trigger": "replay", "data_version": version,
+                         "revision": rev, "run_id": run_id,
+                         "ruleset_fingerprint": rsfp,
+                         "failure_count": len(failures),
+                         "rule_versions": (dict(sorted(req.rule_versions.items()))
+                                           if req.rule_versions else None)})
             adj = self._load_adjudication(conn, product_id, version, rev)
         return self._adjudication_out(adj)
 
@@ -583,7 +636,8 @@ class Service:
                 (run_id,))
             return self._adjudication_out_conn(conn, row)
 
-    def freeze(self, product_id: str, data_version: int | None = None
+    def freeze(self, product_id: str, data_version: int | None = None,
+               actor: str = "system"
                ) -> tuple[AdjudicationOut, dict, str]:
         """冻结某快照最新修订版的发布判断；幂等：重复冻结返回原凭据。"""
         # 签名密钥的惰性生成发生在写事务之外，避免同连接嵌套事务
@@ -668,6 +722,30 @@ class Service:
                 "body_json,signature,created_at) VALUES(?,?,?,?,?,?,?)",
                 (cred_id, product_id, data_version, revision,
                  Store.dumps(body), signature, frozen_at))
+            # 冻结与凭据签发是同一事务内的两条不可分割审计事件
+            audit.append_event(
+                conn, product_id=product_id, event_type="adjudication_frozen",
+                object_type="adjudication",
+                object_ref=f"{product_id}:v{data_version}:r{revision}",
+                actor=actor, occurred_at=frozen_at,
+                data_version=data_version, revision=revision,
+                run_id=adj["run_id"], credential_id=cred_id,
+                payload={"data_version": data_version, "revision": revision,
+                         "run_id": adj["run_id"], "credential_id": cred_id,
+                         "frozen_at": frozen_at, "failure_count": total,
+                         "suppressed_count": suppressed,
+                         "effective_count": effective,
+                         "verdict": "pass" if effective == 0 else "fail"})
+            audit.append_event(
+                conn, product_id=product_id, event_type="credential_issued",
+                object_type="credential", object_ref=cred_id,
+                actor=actor, occurred_at=frozen_at,
+                data_version=data_version, revision=revision,
+                run_id=adj["run_id"], credential_id=cred_id,
+                payload={"credential_id": cred_id, "data_version": data_version,
+                         "revision": revision, "run_id": adj["run_id"],
+                         "signature": signature, "algorithm": "Ed25519",
+                         "frozen_at": frozen_at})
             adj = self._load_adjudication(conn, product_id, data_version, revision)
             out = self._adjudication_out_conn(conn, adj)
             return out, body, signature
@@ -786,15 +864,33 @@ class Service:
             now = self.clock()
             expires = iso(now + timedelta(seconds=ttl_seconds)) if ttl_seconds else None
             eid = new_id("exmp")
+            granted_at = iso(now)
             conn.execute(
-                "INSERT INTO exemptions(exemption_id,product_id,data_version,rule_id,"
+                "INSERT INTO exemptions(exemption_id,product_id,data_version,run_id,rule_id,"
                 "rule_version,rule_fingerprint,sample_fingerprint,table_name,row_pk,"
                 "reason,actor,status,expires_at,created_at,revoked_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (eid, run["product_id"], run["data_version"], f["rule_id"],
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (eid, run["product_id"], run["data_version"], run_id, f["rule_id"],
                  f["rule_version"], f["rule_fingerprint"], f["sample_fingerprint"],
                  f["table_name"], f["row_pk"], reason, actor, "active",
-                 expires, iso(now), None))
+                 expires, granted_at, None))
+            adj_row = self.store.qone(
+                conn, "SELECT revision FROM adjudications WHERE run_id=?", (run_id,))
+            audit.append_event(
+                conn, product_id=run["product_id"], event_type="exemption_granted",
+                object_type="exemption", object_ref=eid, actor=actor,
+                occurred_at=granted_at, data_version=run["data_version"],
+                revision=adj_row["revision"] if adj_row else None,
+                run_id=run_id,
+                payload={"exemption_id": eid, "run_id": run_id,
+                         "data_version": run["data_version"],
+                         "revision": adj_row["revision"] if adj_row else None,
+                         "rule_id": f["rule_id"], "rule_version": f["rule_version"],
+                         "rule_fingerprint": f["rule_fingerprint"],
+                         "sample_fingerprint": f["sample_fingerprint"],
+                         "table_name": f["table_name"], "row_pk": f["row_pk"],
+                         "reason": reason, "ttl_seconds": ttl_seconds,
+                         "expires_at": expires})
             row = self.store.qone(
                 conn, "SELECT * FROM exemptions WHERE exemption_id=?", (eid,))
         return self._exemption_out(row)
@@ -807,9 +903,29 @@ class Service:
                 raise DomainError(404, "exemption_not_found", exemption_id)
             if row["status"] == "revoked":
                 raise DomainError(409, "exemption_already_revoked", exemption_id)
+            revoked_at = iso(self.clock())
             conn.execute(
                 "UPDATE exemptions SET status='revoked', revoked_at=? WHERE exemption_id=?",
-                (iso(self.clock()), exemption_id))
+                (revoked_at, exemption_id))
+            # 豁免记住授予时的来源 run；revision 经该 run 精确反查，
+            # 同一 (规则指纹, 样本指纹) 在多个修订版上重复出现时也不会错配
+            adj_row = self.store.qone(
+                conn,
+                "SELECT revision, run_id FROM adjudications WHERE run_id=?",
+                (row["run_id"],))
+            audit.append_event(
+                conn, product_id=row["product_id"], event_type="exemption_revoked",
+                object_type="exemption", object_ref=exemption_id, actor=actor,
+                occurred_at=revoked_at, data_version=row["data_version"],
+                revision=adj_row["revision"] if adj_row else None,
+                run_id=adj_row["run_id"] if adj_row else None,
+                payload={"exemption_id": exemption_id,
+                         "data_version": row["data_version"],
+                         "run_id": row["run_id"],
+                         "rule_fingerprint": row["rule_fingerprint"],
+                         "sample_fingerprint": row["sample_fingerprint"],
+                         "table_name": row["table_name"], "row_pk": row["row_pk"],
+                         "reason": reason, "revoked_at": revoked_at})
             row = self.store.qone(
                 conn, "SELECT * FROM exemptions WHERE exemption_id=?", (exemption_id,))
         return self._exemption_out(row)
@@ -850,6 +966,28 @@ class Service:
         page = rows[:page_size]
         nxt = page[-1]["exemption_id"] if len(rows) > page_size else None
         return [self._exemption_out(r) for r in page], nxt
+
+    # =====================================================================
+    # 合规复核：审计账本
+    # =====================================================================
+
+    def audit_page(self, product_id: str, *, cursor: str | None = None,
+                   page_size: int = 50, start_time: str | None = None,
+                   end_time: str | None = None) -> dict:
+        return audit.AuditLedger(self.store).read_page(
+            product_id, cursor=cursor, page_size=page_size,
+            start_time=start_time, end_time=end_time)
+
+    def audit_export(self, product_id: str, *, start_seq: int = 1,
+                     end_seq: int | None = None, fmt: str = "json"
+                     ) -> tuple[list[dict], str]:
+        return audit.AuditLedger(self.store).export(
+            product_id, start_seq=start_seq, end_seq=end_seq, fmt=fmt)
+
+    def audit_verify(self, product_id: str, *, start_seq: int = 1,
+                     end_seq: int | None = None) -> dict:
+        return audit.AuditLedger(self.store).verify_chain(
+            product_id, start_seq=start_seq, end_seq=end_seq)
 
     # =====================================================================
     # 凭据

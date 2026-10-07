@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS exemptions (
     exemption_id       TEXT PRIMARY KEY,
     product_id         TEXT NOT NULL,
     data_version       INTEGER NOT NULL,
+    run_id             TEXT NOT NULL,   -- 授予时所针对失败样本的来源 run
     rule_id            TEXT NOT NULL,
     rule_version       INTEGER NOT NULL,
     rule_fingerprint   TEXT NOT NULL,
@@ -169,6 +170,28 @@ CREATE TABLE IF NOT EXISTS credentials (
     created_at   TEXT NOT NULL,
     UNIQUE (product_id, data_version, revision)
 );
+
+-- 合规复核裁决审计账本：每产品一条仅追加的哈希链（seq 在产品内连续无空洞）。
+-- 服务层不提供任何 UPDATE/DELETE 路径；任何带外篡改都会被验真接口检出。
+CREATE TABLE IF NOT EXISTS audit_events (
+    product_id    TEXT NOT NULL,
+    seq           INTEGER NOT NULL,   -- 产品内事件序号，从 1 连续递增
+    event_type    TEXT NOT NULL,
+    object_type   TEXT NOT NULL,       -- 业务对象类型
+    object_ref    TEXT NOT NULL,       -- 业务对象标识
+    actor         TEXT NOT NULL,
+    occurred_at   TEXT NOT NULL,
+    data_version  INTEGER,
+    revision      INTEGER,
+    run_id        TEXT,
+    credential_id TEXT,
+    payload_json  TEXT NOT NULL,       -- 事件特定细节（规范化 JSON）
+    prev_digest   TEXT NOT NULL,       -- 前一事件摘要（首条为 64 个 0）
+    digest        TEXT NOT NULL,       -- 本事件摘要（覆盖全部上述字段）
+    PRIMARY KEY (product_id, seq)
+);
+CREATE INDEX IF NOT EXISTS ix_audit_time
+    ON audit_events(product_id, occurred_at, seq);
 """
 
 
@@ -188,6 +211,15 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._lock = threading.RLock()
         self._conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """轻量迁移：为既有库补齐后加列（新库建表时已含）。"""
+        cols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(exemptions)")}
+        if "run_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE exemptions ADD COLUMN run_id TEXT NOT NULL DEFAULT ''")
 
     @property
     def lock(self) -> threading.RLock:

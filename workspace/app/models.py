@@ -75,6 +75,7 @@ class CreateRule(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     kind: RuleKind
     config: dict[str, Any]
+    actor: str = Field(default="system", min_length=1, max_length=64)
 
 
 class RuleVersionOut(BaseModel):
@@ -97,6 +98,7 @@ class RuleOut(BaseModel):
 
 class ActivateRule(BaseModel):
     version: int = Field(ge=1)
+    actor: str = Field(default="system", min_length=1, max_length=64)
 
 
 class ReplayRequest(BaseModel):
@@ -192,6 +194,46 @@ class CredentialOut(BaseModel):
     signature: str
     created_at: str
     verify_url: str
+
+
+# ---------- 审计账本 ----------
+
+class AuditEventOut(BaseModel):
+    product_id: str
+    seq: int
+    event_type: str
+    object_type: str
+    object_ref: str
+    actor: str
+    occurred_at: str
+    data_version: int | None = None
+    revision: int | None = None
+    run_id: str | None = None
+    credential_id: str | None = None
+    payload: dict[str, Any]
+    prev_digest: str
+    digest: str
+
+
+class AuditPage(BaseModel):
+    product_id: str
+    page_size: int
+    start_time: str | None = None
+    end_time: str | None = None
+    after_seq: int
+    next_cursor: str | None
+    items: list[AuditEventOut]
+    snapshot_note: str
+
+
+class AuditVerifyOut(BaseModel):
+    valid: bool
+    product_id: str
+    start_seq: int
+    end_seq: int
+    checked_events: int
+    chain_tip_digest: str
+    algorithm: str
 
 
 class ErrorOut(BaseModel):

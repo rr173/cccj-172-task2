@@ -10,6 +10,8 @@ from . import security
 from .models import (
     ActivateRule,
     AdjudicationOut,
+    AuditPage,
+    AuditVerifyOut,
     CreateProduct,
     CreateRule,
     ExemptionOut,
@@ -26,6 +28,13 @@ from .models import (
 )
 from .service import DomainError, Service
 from .storage import Store
+
+#: 审计账本 CSV 导出列（payload 为规范化 JSON 文本）
+AUDIT_CSV_COLUMNS = [
+    "product_id", "seq", "event_type", "object_type", "object_ref", "actor",
+    "occurred_at", "data_version", "revision", "run_id", "credential_id",
+    "prev_digest", "digest", "payload_json",
+]
 
 
 def create_app(store: Store | None = None) -> FastAPI:
@@ -88,8 +97,9 @@ def create_app(store: Store | None = None) -> FastAPI:
               response_model=AdjudicationOut, tags=["数据产品-发布冻结"],
               summary="冻结最新修订版的发布判断并签发质量凭据（幂等）")
     def freeze(product_id: str, data_version: int | None = Query(default=None),
+               actor: str = Query(default="system", min_length=1, max_length=64),
                service: Service = Depends(svc)):
-        out, _, _ = service.freeze(product_id, data_version)
+        out, _, _ = service.freeze(product_id, data_version, actor)
         return out
 
     # ---------------- 规则 API ----------------
@@ -118,13 +128,13 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise DomainError(409, "product_mismatch",
                               {"rule_product": rule.product_id,
                                "body_product": req.product_id})
-        return service.add_rule_version(rule_id, req.kind, req.config)
+        return service.add_rule_version(rule_id, req.kind, req.config, req.actor)
 
     @app.post("/rules/{rule_id}/activate",
               response_model=RuleOut, tags=["规则 API"],
               summary="切换激活规则版本（仅影响此后的新发布/回放）")
     def activate_rule(rule_id: str, req: ActivateRule, service: Service = Depends(svc)):
-        return service.activate_rule(rule_id, req.version)
+        return service.activate_rule(rule_id, req.version, req.actor)
 
     @app.post("/products/{product_id}/replay",
               response_model=AdjudicationOut, status_code=201,
@@ -188,6 +198,76 @@ def create_app(store: Store | None = None) -> FastAPI:
             product_id, data_version, status_filter, page_size, cursor)
         return {"page_size": page_size, "next_cursor": next_cursor,
                 "items": [i.model_dump() for i in items]}
+
+    # ---------------- 合规复核：裁决审计账本 ----------------
+
+    @app.get("/products/{product_id}/audit/events",
+             response_model=AuditPage, tags=["裁决审计账本"],
+             summary="按产品与时间范围游标读取审计事件；游标绑定固定起点，并发写入不丢不重")
+    def audit_events(product_id: str,
+                     cursor: str | None = Query(default=None),
+                     page_size: int = Query(default=50, ge=1, le=200),
+                     start_time: str | None = Query(
+                         default=None, description="ISO-8601 起（含），如 2026-10-01T00:00:00Z"),
+                     end_time: str | None = Query(
+                         default=None, description="ISO-8601 止（不含）"),
+                     service: Service = Depends(svc)):
+        return service.audit_page(product_id, cursor=cursor, page_size=page_size,
+                                  start_time=start_time, end_time=end_time)
+
+    @app.get("/products/{product_id}/audit/export",
+             tags=["裁决审计账本"],
+             summary="按事件序号区间导出 CSV 或 JSON（只读，不改变业务数据与裁决状态）")
+    def audit_export(product_id: str,
+                     start_seq: int = Query(default=1, ge=1),
+                     end_seq: int | None = Query(default=None, ge=1),
+                     fmt: str = Query(default="json", pattern="^(json|csv)$"),
+                     service: Service = Depends(svc)):
+        items, fmt = service.audit_export(
+            product_id, start_seq=start_seq, end_seq=end_seq, fmt=fmt)
+        fname = f"audit-{product_id}-seq{start_seq}"
+        if end_seq is not None:
+            fname += f"-{end_seq}"
+        if fmt == "csv":
+            import csv
+            import io
+            buf = io.StringIO()
+            writer = csv.writer(buf, lineterminator="\n")
+            writer.writerow(AUDIT_CSV_COLUMNS)
+            for it in items:
+                writer.writerow([
+                    it["product_id"], it["seq"], it["event_type"],
+                    it["object_type"], it["object_ref"], it["actor"],
+                    it["occurred_at"], it["data_version"] if it["data_version"] is not None else "",
+                    it["revision"] if it["revision"] is not None else "",
+                    it["run_id"] or "", it["credential_id"] or "",
+                    it["prev_digest"], it["digest"],
+                    json.dumps(it["payload"], ensure_ascii=False,
+                               sort_keys=True, separators=(",", ":")),
+                ])
+            return Response(
+                content=buf.getvalue(), media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition":
+                         f'attachment; filename="{fname}.csv"'})
+        payload = {
+            "export": "audit_events", "product_id": product_id,
+            "start_seq": start_seq, "end_seq": end_seq,
+            "count": len(items), "items": items,
+        }
+        return Response(
+            content=json.dumps(payload, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{fname}.json"'})
+
+    @app.get("/products/{product_id}/audit/verify",
+             response_model=AuditVerifyOut, tags=["裁决审计账本"],
+             summary="从任意序号起点重算摘要链验真；断裂时明确指出断点序号与类型")
+    def audit_verify(product_id: str,
+                     start_seq: int = Query(default=1, ge=1),
+                     end_seq: int | None = Query(default=None, ge=1),
+                     service: Service = Depends(svc)):
+        return service.audit_verify(product_id, start_seq=start_seq, end_seq=end_seq)
 
     # ---------------- 质量凭据 ----------------
 
